@@ -68,54 +68,88 @@ describe('gemini send strategy', () => {
         expect(__test__.GEMINI_COMPOSER_SELECTORS).toContain('.ql-editor[contenteditable="true"]');
         expect(__test__.GEMINI_COMPOSER_SELECTORS).toContain('.ql-editor[role="textbox"]');
     });
-    it('prefers native text insertion before submitting the composer', async () => {
+    it('uses page.typeText (CDP insert) into the composer, the Quill path', async () => {
         const page = createPageMock();
+        page.typeText.mockResolvedValue({ matches_n: 1, match_level: 'exact' });
         const evaluate = vi.mocked(page.evaluate);
-        const nativeType = vi.mocked(page.nativeType);
-        const nativeKeyPress = vi.mocked(page.nativeKeyPress);
         evaluate
             .mockResolvedValueOnce('https://gemini.google.com/app')
             .mockResolvedValueOnce({ ok: true })
             .mockResolvedValueOnce({ hasText: true })
-            .mockResolvedValueOnce('button');
+            .mockResolvedValueOnce({ text: '你好' })
+            .mockResolvedValueOnce({ type: 'enter' })
+            .mockResolvedValueOnce(undefined);
         const result = await sendGeminiMessage(page, '你好');
-        expect(nativeType).toHaveBeenCalledWith('你好');
-        expect(nativeKeyPress).not.toHaveBeenCalled();
-        expect(result).toBe('button');
-    });
-    it('falls back when native insertion does not update the composer', async () => {
-        const page = createPageMock();
-        const evaluate = vi.mocked(page.evaluate);
-        const nativeType = vi.mocked(page.nativeType);
-        const nativeKeyPress = vi.mocked(page.nativeKeyPress);
-        evaluate
-            .mockResolvedValueOnce('https://gemini.google.com/app')
-            .mockResolvedValueOnce({ ok: true })
-            .mockResolvedValueOnce({ hasText: false })
-            .mockResolvedValueOnce({ hasText: true })
-            .mockResolvedValueOnce('enter');
-        const result = await sendGeminiMessage(page, '你好');
-        expect(nativeType).toHaveBeenCalledWith('你好');
-        expect(nativeKeyPress).toHaveBeenCalledWith('Enter');
-        expect(evaluate).toHaveBeenCalledTimes(5);
+        expect(page.typeText).toHaveBeenCalledWith('[aria-label="为 Gemini 输入提示"]', '你好');
+        expect(page.nativeKeyPress).toHaveBeenCalledWith('Enter');
         expect(result).toBe('enter');
     });
-    it('falls back when native insertion throws', async () => {
+    it('falls back to per-character key presses when CDP insertion does not resolve', async () => {
+        const page = createPageMock();
+        const evaluate = vi.mocked(page.evaluate);
+        const nativeKeyPress = vi.mocked(page.nativeKeyPress);
+        evaluate
+            .mockResolvedValueOnce('https://gemini.google.com/app')
+            .mockResolvedValueOnce({ ok: true })
+            .mockResolvedValueOnce(undefined)
+            .mockResolvedValueOnce({ hasText: true })
+            .mockResolvedValueOnce({ text: '你好' })
+            .mockResolvedValueOnce({ type: 'enter' })
+            .mockResolvedValueOnce(undefined);
+        const result = await sendGeminiMessage(page, '你好');
+        expect(nativeKeyPress).toHaveBeenCalledWith('你');
+        expect(nativeKeyPress).toHaveBeenCalledWith('好');
+        expect(result).toBe('enter');
+    });
+    it('falls back to nativeType when CDP insertion and per-character key presses fail', async () => {
         const page = createPageMock();
         const evaluate = vi.mocked(page.evaluate);
         const nativeType = vi.mocked(page.nativeType);
-        nativeType.mockRejectedValueOnce(new Error('Unknown action: cdp'));
+        evaluate
+            .mockResolvedValueOnce('https://gemini.google.com/app')
+            .mockResolvedValueOnce({ ok: true })
+            .mockResolvedValueOnce(undefined)
+            .mockResolvedValueOnce({ hasText: false })
+            .mockResolvedValueOnce({ hasText: true })
+            .mockResolvedValueOnce({ text: '你好' })
+            .mockResolvedValueOnce({ type: 'enter' })
+            .mockResolvedValueOnce(undefined);
+        const result = await sendGeminiMessage(page, '你好');
+        expect(nativeType).toHaveBeenCalledWith('你好');
+        expect(result).toBe('enter');
+    });
+    it('falls back to insertComposerTextFallbackScript when every insertion path fails', async () => {
+        const page = createPageMock();
+        const evaluate = vi.mocked(page.evaluate);
+        evaluate
+            .mockResolvedValueOnce('https://gemini.google.com/app')
+            .mockResolvedValueOnce({ ok: true })
+            .mockResolvedValueOnce(undefined)
+            .mockResolvedValueOnce({ hasText: false })
+            .mockResolvedValueOnce({ hasText: false })
+            .mockResolvedValueOnce({ hasText: true })
+            .mockResolvedValueOnce({ text: '你好' })
+            .mockResolvedValueOnce({ type: 'enter' })
+            .mockResolvedValueOnce(undefined);
+        const result = await sendGeminiMessage(page, '你好');
+        expect(evaluate).toHaveBeenCalledWith(__test__.insertComposerTextFallbackScript('你好'));
+        expect(result).toBe('enter');
+    });
+    it('refuses to submit when the composer holds stale content, not the intended prompt', async () => {
+        const page = createPageMock();
+        page.typeText.mockResolvedValue({ matches_n: 1, match_level: 'exact' });
+        const evaluate = vi.mocked(page.evaluate);
         evaluate
             .mockResolvedValueOnce('https://gemini.google.com/app')
             .mockResolvedValueOnce({ ok: true })
             .mockResolvedValueOnce({ hasText: true })
-            .mockResolvedValueOnce('button');
-        const result = await sendGeminiMessage(page, '你好');
-        expect(nativeType).toHaveBeenCalledWith('你好');
-        expect(result).toBe('button');
+            .mockResolvedValueOnce({ text: '燕麦奶拿铁的电商主图' })
+            .mockResolvedValueOnce({ type: 'enter' });
+        await expect(sendGeminiMessage(page, '抹茶拿铁')).rejects.toThrow(/does not contain the intended prompt/);
     });
     it('retries composer preparation until a slow-loading composer appears', async () => {
         const page = createPageMock();
+        page.typeText.mockResolvedValue({ matches_n: 1, match_level: 'exact' });
         const evaluate = vi.mocked(page.evaluate);
         const wait = vi.mocked(page.wait);
         evaluate
@@ -124,13 +158,16 @@ describe('gemini send strategy', () => {
             .mockResolvedValueOnce({ ok: false, reason: 'Could not find Gemini composer' })
             .mockResolvedValueOnce({ ok: true })
             .mockResolvedValueOnce({ hasText: true })
-            .mockResolvedValueOnce('button');
+            .mockResolvedValueOnce({ text: '你好' })
+            .mockResolvedValueOnce({ type: 'enter' })
+            .mockResolvedValueOnce(undefined);
         const result = await sendGeminiMessage(page, '你好');
-        expect(result).toBe('button');
+        expect(result).toBe('enter');
         expect(wait.mock.calls.filter(([value]) => value === 1)).toHaveLength(3);
     });
     it('keeps retrying until a composer that appears on the fourth attempt is ready', async () => {
         const page = createPageMock();
+        page.typeText.mockResolvedValue({ matches_n: 1, match_level: 'exact' });
         const evaluate = vi.mocked(page.evaluate);
         const wait = vi.mocked(page.wait);
         evaluate
@@ -140,17 +177,22 @@ describe('gemini send strategy', () => {
             .mockResolvedValueOnce({ ok: false, reason: 'Could not find Gemini composer' })
             .mockResolvedValueOnce({ ok: true })
             .mockResolvedValueOnce({ hasText: true })
-            .mockResolvedValueOnce('button');
+            .mockResolvedValueOnce({ text: '你好' })
+            .mockResolvedValueOnce({ type: 'enter' })
+            .mockResolvedValueOnce(undefined);
         const result = await sendGeminiMessage(page, '你好');
-        expect(result).toBe('button');
+        expect(result).toBe('enter');
         expect(wait.mock.calls.filter(([value]) => value === 1)).toHaveLength(4);
     });
     it('avoids innerHTML in the fallback insertion path for trusted types pages', () => {
         expect(__test__.insertComposerTextFallbackScript('你好')).not.toContain('innerHTML');
         expect(__test__.insertComposerTextFallbackScript('你好')).toContain('replaceChildren');
     });
-    it('keeps a button submit path in the generated submit script', () => {
-        expect(__test__.submitComposerScript()).toContain('.click()');
+    it('prepares a native-coordinate button submit path in the generated submit script', () => {
+        const script = __test__.submitComposerScript();
+        expect(script).toContain('scrollIntoView');
+        expect(script).toContain("type: 'button'");
+        expect(script).toContain('getBoundingClientRect');
     });
     it('matches the Traditional Chinese send label in the generated submit script', () => {
         expect(__test__.submitComposerScript()).toContain('傳送');

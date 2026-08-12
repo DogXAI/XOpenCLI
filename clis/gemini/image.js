@@ -94,8 +94,34 @@ export const imageCommand = cli({
             await startNewGeminiChat(page);
         const beforeUrls = await getGeminiVisibleImageUrls(page);
         await sendGeminiMessage(page, effectivePrompt);
-        const urls = await waitForGeminiImages(page, beforeUrls, timeout);
-        const link = await currentGeminiLink(page);
+        // Capture the conversation URL after send so a slow generation can be
+        // re-queried on the same conversation without re-sending (re-sending
+        // would duplicate the request and waste generation quota). Only report
+        // failure once we can confirm no image exists — a transient poll miss
+        // is not a failure.
+        let convUrl = await currentGeminiLink(page);
+        // 生成预算 --timeout + 20s 重试窗：慢生成在窗口内继续等图，不无限重试。
+        // func 总时长 ≤ timeout+20 < CLI 层超时（timeout+30），保证报出
+        // EmptyResultError 带对话 URL，而不是打印超时后进程挂起。
+        const deadline = Date.now() + (timeout + 20) * 1000;
+        let urls = await waitForGeminiImages(page, beforeUrls, timeout);
+        let lastError = null;
+        for (let attempt = 0; attempt < 3 && !urls.length && Date.now() < deadline; attempt += 1) {
+            try {
+                await page.wait(5);
+                const u = await currentGeminiLink(page);
+                if (u && u !== convUrl) convUrl = u;
+                const remaining = Math.max(10, Math.ceil((deadline - Date.now()) / 1000));
+                urls = await waitForGeminiImages(page, beforeUrls, remaining);
+            }
+            catch (err) {
+                lastError = err;
+            }
+        }
+        if (urls.length === 0 && lastError) {
+            throw lastError;
+        }
+        const link = convUrl;
         if (!urls.length) {
             throw new EmptyResultError('gemini image', `No generated image was detected. Open ${link} and check whether Gemini produced one.`);
         }

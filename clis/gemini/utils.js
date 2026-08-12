@@ -488,13 +488,19 @@ function prepareComposerScript() {
 
       try {
         composer.focus();
+        // 先走原生 selectAll+delete 清空：Quill 监听原生编辑命令，textContent=''
+        // 只清 DOM 不清内部 delta，残留旧文本会在 submit 时被重新提交（发错 prompt）。
+        if (typeof document.execCommand === 'function') {
+          document.execCommand('selectAll', false, undefined);
+          document.execCommand('delete', false, undefined);
+        }
+        composer.textContent = '';
         const selection = window.getSelection();
         const range = document.createRange();
         range.selectNodeContents(composer);
         range.collapse(false);
         selection?.removeAllRanges();
         selection?.addRange(range);
-        composer.textContent = '';
         composer.dispatchEvent(new InputEvent('input', { bubbles: true, data: '', inputType: 'deleteContentBackward' }));
       } catch (error) {
         return {
@@ -519,6 +525,15 @@ function composerHasTextScript() {
       return {
         hasText: !!(composer && ((composer.textContent || '').trim() || (composer.innerText || '').trim())),
       };
+    })()
+  `;
+}
+function composerTextScript() {
+    return `
+    (() => {
+      ${buildGeminiComposerLocatorScript()}
+      const composer = findComposer();
+      return { text: composer ? (composer.textContent || composer.innerText || '') : '' };
     })()
   `;
 }
@@ -627,11 +642,14 @@ function submitComposerScript() {
       }
 
       if (bestButton instanceof HTMLElement && bestScore >= 3) {
-        bestButton.click();
-        return 'button';
+        // Scroll into view so the button lands inside the viewport; a CDP
+        // mouse click at off-screen coordinates hits nothing.
+        bestButton.scrollIntoView({ block: 'center', behavior: 'instant' });
+        const rect = bestButton.getBoundingClientRect();
+        return { type: 'button', x: Math.round(rect.left + rect.width / 2), y: Math.round(rect.top + rect.height / 2) };
       }
 
-      return 'enter';
+      return { type: 'enter' };
     })()
   `;
 }
@@ -1300,7 +1318,33 @@ export async function sendGeminiMessage(page, text) {
         throw new CommandExecutionError(prepared?.reason || 'Could not find Gemini composer');
     }
     let hasText = false;
-    if (page.nativeType) {
+    // Quill (current Gemini UI) does not recognize bare Input.insertText; the
+    // `browser type` path (page.typeText) prepares the target with CDP
+    // scrollIntoView + DOM.focus before inserting, which is what activates the
+    // Quill delta. Fall back to per-character key presses for residual cases.
+    if (page.typeText) {
+        try {
+            const resolved = await page.typeText(`[aria-label="为 Gemini 输入提示"]`, text);
+            if (resolved) {
+                const state = await page.evaluate(composerHasTextScript());
+                hasText = !!state?.hasText;
+            }
+        }
+        catch { }
+    }
+    if (!hasText && page.nativeKeyPress) {
+        try {
+            await page.evaluate(`(() => { const c = document.querySelector('.ql-editor'); if (c) c.focus(); })()`).catch(() => {});
+            for (const ch of text) {
+                await page.nativeKeyPress(ch);
+                await page.wait(0.02);
+            }
+            const state = await page.evaluate(composerHasTextScript());
+            hasText = !!state?.hasText;
+        }
+        catch { }
+    }
+    if (!hasText && page.nativeType) {
         try {
             await page.nativeType(text);
             await page.wait(0.2);
@@ -1316,13 +1360,32 @@ export async function sendGeminiMessage(page, text) {
     if (!hasText) {
         throw new CommandExecutionError('Failed to insert text into Gemini composer');
     }
+    // 提交前校验 composer 实际内容包含本次 prompt 的显著片段：Quill 残留旧文本时
+    // hasText 也会为 true（composer 里确实有字），直接 submit 会把旧 prompt 发出去
+    //（如 抹茶 被发成 燕麦奶）。不匹配则拒绝提交并抛错，提示清空重试。
+    const signature = String(text).trim().slice(0, 15);
+    const composerCheck = await page.evaluate(composerTextScript());
+    const composerText = String(composerCheck?.text || '');
+    if (!signature || !composerText.includes(signature)) {
+        throw new CommandExecutionError(
+            `Gemini composer does not contain the intended prompt (expected "${signature}…", got "${(composerText || '').trim().slice(0, 30)}…"). Clear the composer and retry.`,
+        );
+    }
     const submitAction = await page.evaluate(submitComposerScript());
-    if (submitAction === 'button') {
-        await page.wait(1);
-        return 'button';
+    // An in-page .click() on the send button is ignored by Gemini's React
+    // handler; a real CDP mouse click at the button coordinates submits.
+    if (submitAction?.type === 'button' && typeof submitAction.x === 'number' && page.nativeClick) {
+        try {
+            await page.nativeClick(submitAction.x, submitAction.y);
+            await page.wait(1.5);
+            const cleared = await page.evaluate(`(() => { const c = document.querySelector('.ql-editor'); return c ? !(c.textContent || '').trim() : true; })()`).catch(() => false);
+            if (cleared) return 'button';
+        }
+        catch { }
     }
     if (page.nativeKeyPress) {
         try {
+            await page.evaluate(`(() => { const c = document.querySelector('.ql-editor'); if (c) c.focus(); })()`).catch(() => {});
             await page.nativeKeyPress('Enter');
         }
         catch {
@@ -2339,17 +2402,29 @@ export async function getGeminiVisibleImageUrls(page) {
         return rect.width > 32 && rect.height > 32;
       };
 
-      const imgs = Array.from(document.querySelectorAll('main img')).filter((img) => img instanceof HTMLImageElement && isVisible(img));
+      const imgs = Array.from(document.querySelectorAll('main img')).filter((img) => img instanceof HTMLImageElement);
       const urls = [];
       const seen = new Set();
 
       for (const img of imgs) {
         const src = img.currentSrc || img.src || '';
         const alt = (img.getAttribute('alt') || '').toLowerCase();
-        const width = img.naturalWidth || img.width || 0;
-        const height = img.naturalHeight || img.height || 0;
         if (!src) continue;
         if (alt.includes('avatar') || alt.includes('logo') || alt.includes('icon')) continue;
+        // 生成图走热链/内存态：gg/ 图页内 naturalWidth 恒为 0（热链保护）、blob: 图
+        // 是瞬态 object URL，两者都可能 nw=0、complete 永假、布局高 0。套
+        // complete/尺寸/可见门槛会检测不到、image 命令一直等。按 URL 特征收录
+        //（gg/ 持久 CDN 或 blob: 内存 URL）；导出阶段按类型处理（gg/ 新 tab、blob: fetch）。
+        const generated = src.startsWith('blob:') || src.includes('googleusercontent.com/gg/');
+        if (generated) {
+          if (seen.has(src)) continue;
+          seen.add(src);
+          urls.push(src);
+          continue;
+        }
+        if (!isVisible(img)) continue;
+        const width = img.naturalWidth || img.width || 0;
+        const height = img.naturalHeight || img.height || 0;
         // A placeholder still streaming its bytes reports complete false and
         // naturalWidth 0 while laying out at full size, so the size gate below
         // would accept it and the export step would save a blank frame (#2245).
@@ -2387,12 +2462,19 @@ export async function isGeminiGenerating(page) {
 export async function waitForGeminiImages(page, beforeUrls, timeoutSeconds) {
     const beforeSet = new Set(beforeUrls);
     const pollIntervalSeconds = 3;
+    // 轮询次数上限（mock 的即时 wait 下 Date.now 不推进，纯 deadline 会空转）+
+    // 绝对 deadline（真实环境下 per-poll 的 page.evaluate 往返会拖长，deadline 兜底
+    // 保证不超出 timeoutSeconds）——两者共同把 waitForGeminiImages 封顶在预算内，
+    // image 命令总时长可控，不会拖到 CLI 层超时把命令打挂。
     const maxPolls = Math.max(1, Math.ceil(timeoutSeconds / pollIntervalSeconds));
+    const deadline = Date.now() + timeoutSeconds * 1000;
     let lastUrls = [];
     let stableCount = 0;
     let stillGenerating = false;
     for (let index = 0; index < maxPolls; index += 1) {
         await page.wait(index === 0 ? 2 : pollIntervalSeconds);
+        if (Date.now() >= deadline)
+            break;
         // The text waits already gate on this signal; without it the image wait
         // can settle on whatever is on screen mid-generation (#2245). An
         // unreadable probe keeps the last known state so the deadline still
@@ -2400,13 +2482,10 @@ export async function waitForGeminiImages(page, beforeUrls, timeoutSeconds) {
         const generating = await isGeminiGenerating(page);
         if (generating !== null)
             stillGenerating = generating;
-        if (generating === true) {
-            lastUrls = [];
-            stableCount = 0;
-            continue;
-        }
-        if (stillGenerating)
-            continue;
+        // Do not skip the image scan while generating — the current Gemini UI's
+        // stop-button probe can miss, and the image can be ready before the
+        // probe clears. Scan every poll; the stability check filters transient
+        // placeholder frames.
         const urls = (await getGeminiVisibleImageUrls(page)).filter((url) => !beforeSet.has(url));
         if (urls.length === 0)
             continue;
@@ -2418,11 +2497,8 @@ export async function waitForGeminiImages(page, beforeUrls, timeoutSeconds) {
             lastUrls = urls;
             stableCount = 1;
         }
-        if (stableCount >= 2 || index === maxPolls - 1)
+        if (stableCount >= 2)
             return lastUrls;
-    }
-    if (stillGenerating) {
-        throw new TimeoutError('gemini image', timeoutSeconds, 'Gemini was still generating at the deadline. Re-run with a higher --timeout.');
     }
     return lastUrls;
 }
@@ -2507,6 +2583,48 @@ export async function exportGeminiImages(page, urls) {
             || typeof asset.mimeType !== 'string'
             || !asset.mimeType.startsWith('image/')) {
             throw new CommandExecutionError('Gemini image export returned a malformed result');
+        }
+    }
+
+    // 热链生成图（googleusercontent.com/gg/）页内 fetch 被 CORS 拦截、img
+    // naturalWidth=0 无法 canvas，页内导出会全部失败。新 tab 打开 URL（302 到
+    // 同源防热链域名）后，img 与 tab 同源，canvas 可正常编码导出。
+    const exportedUrls = new Set(assets.map((a) => String(a.url)));
+    const failedUrls = urls.filter((u) => !exportedUrls.has(u));
+    if (failedUrls.length && page.newTab && page.closeTab) {
+        const origTab = page.getActivePage ? page.getActivePage() : undefined;
+        for (const targetUrl of failedUrls) {
+            try {
+                const tab = await page.newTab(targetUrl);
+                if (!tab)
+                    continue;
+                await page.selectTab(tab);
+                await page.sleep(2);
+                const tabAsset = await page.evaluate(`(() => {
+                  const img = document.querySelector('img');
+                  if (!(img instanceof HTMLImageElement) || !img.complete || !img.naturalWidth) return null;
+                  const c = document.createElement('canvas');
+                  c.width = img.naturalWidth;
+                  c.height = img.naturalHeight;
+                  const ctx = c.getContext('2d');
+                  if (!ctx) return null;
+                  ctx.drawImage(img, 0, 0);
+                  const jpg = c.toDataURL('image/jpeg', 0.92);
+                  const png = c.toDataURL('image/png');
+                  const dataUrl = jpg.length <= png.length ? jpg : png;
+                  return { dataUrl, mimeType: jpg.length <= png.length ? 'image/jpeg' : 'image/png' };
+                })()`);
+                if (tabAsset
+                    && /^data:[^;,]+;base64,[A-Za-z0-9+/]+=*$/.test(String(tabAsset.dataUrl || ''))
+                    && String(tabAsset.mimeType || '').startsWith('image/')) {
+                    assets.push({ url: targetUrl, dataUrl: tabAsset.dataUrl, mimeType: tabAsset.mimeType, width: 0, height: 0 });
+                }
+                await page.closeTab(tab);
+            }
+            catch { }
+        }
+        if (origTab) {
+            try { await page.selectTab(origTab); } catch { }
         }
     }
     return assets;

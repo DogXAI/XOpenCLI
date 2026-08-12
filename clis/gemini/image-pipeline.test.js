@@ -62,25 +62,27 @@ function stubFetch(dom, { type }) {
 }
 
 describe('gemini image detection', () => {
-    it('ignores an image that is still streaming its bytes', async () => {
+    it('collects a blob: object URL (Gemini generated-image format) even while streaming', async () => {
         const page = createPageMock();
         mountImage(page.dom, { src: 'blob:https://gemini.google.com/pending', naturalWidth: 0, complete: false });
 
-        await expect(getGeminiVisibleImageUrls(page)).resolves.toEqual([]);
+        // blob: 是 Gemini 新生成图的内存 object URL（瞬态，nw=0 正常），按 URL 特征收录；
+        // 空/未解码的 blob 由 export 阶段的 data-URL 校验拒掉，不会存空白帧（#2245）
+        await expect(getGeminiVisibleImageUrls(page)).resolves.toEqual(['blob:https://gemini.google.com/pending']);
     });
 
-    it('ignores an image that finished loading without decodable bytes', async () => {
+    it('collects a blob: object URL that reports no decodable bytes yet', async () => {
         const page = createPageMock();
         mountImage(page.dom, { src: 'blob:https://gemini.google.com/broken', naturalWidth: 0, complete: true });
 
-        await expect(getGeminiVisibleImageUrls(page)).resolves.toEqual([]);
+        await expect(getGeminiVisibleImageUrls(page)).resolves.toEqual(['blob:https://gemini.google.com/broken']);
     });
 
-    it('ignores an image that reports dimensions before it finished loading', async () => {
+    it('collects a blob: object URL that reports dimensions before finishing loading', async () => {
         const page = createPageMock();
         mountImage(page.dom, { src: 'blob:https://gemini.google.com/partial', naturalWidth: 1024, complete: false });
 
-        await expect(getGeminiVisibleImageUrls(page)).resolves.toEqual([]);
+        await expect(getGeminiVisibleImageUrls(page)).resolves.toEqual(['blob:https://gemini.google.com/partial']);
     });
 
     it('accepts a decoded generated image', async () => {
@@ -100,14 +102,23 @@ describe('gemini image detection', () => {
             'https://lh3.googleusercontent.com/generated.png',
         ]);
     });
+
+    it('detects a hotlink-protected generated image (gg/) even at naturalWidth 0', async () => {
+        const page = createPageMock();
+        mountImage(page.dom, { src: 'https://lh3.googleusercontent.com/gg/ACRwjavi.png', naturalWidth: 0, complete: false });
+
+        await expect(getGeminiVisibleImageUrls(page)).resolves.toEqual([
+            'https://lh3.googleusercontent.com/gg/ACRwjavi.png',
+        ]);
+    });
 });
 
 describe('gemini image wait contract', () => {
-    it('does not settle on the page while Gemini is still generating', async () => {
+    it('accepts the generated image even while the probe still reports generating', async () => {
         const page = createPageMock({ generating: [true] });
         mountImage(page.dom, { src: 'https://lh3.googleusercontent.com/mid.png', naturalWidth: 1024, complete: true });
 
-        await expect(waitForGeminiImages(page, [], 9)).rejects.toThrow(/gemini image timed out/);
+        await expect(waitForGeminiImages(page, [], 9)).resolves.toEqual(['https://lh3.googleusercontent.com/mid.png']);
     });
 
     it('fails closed when the generation probe stops answering', async () => {
@@ -123,11 +134,11 @@ describe('gemini image wait contract', () => {
         await expect(waitForGeminiImages(page, [], 9)).rejects.toMatchObject({ code: 'COMMAND_EXEC' });
     });
 
-    it('drops candidate images if the generation probe resumes as still generating', async () => {
+    it('keeps the detected image even if the probe resumes reporting generating', async () => {
         const page = createPageMock({ generating: [false, true, true] });
         mountImage(page.dom, { src: 'https://lh3.googleusercontent.com/transient.png', naturalWidth: 1024, complete: true });
 
-        await expect(waitForGeminiImages(page, [], 9)).rejects.toThrow(/gemini image timed out/);
+        await expect(waitForGeminiImages(page, [], 9)).resolves.toEqual(['https://lh3.googleusercontent.com/transient.png']);
     });
 
     it('returns the image once generation has stopped', async () => {
@@ -143,7 +154,8 @@ describe('gemini image wait contract', () => {
         const page = wrapEvaluate(createPageMock({ generating: [true] }));
         mountImage(page.dom, { src: 'https://lh3.googleusercontent.com/mid.png', naturalWidth: 1024, complete: true });
 
-        await expect(waitForGeminiImages(page, [], 9)).rejects.toThrow(/gemini image timed out/);
+        // 若不解包信封，isGeminiGenerating 会因非 boolean 抛错；解包后才能扫描到图并返回
+        await expect(waitForGeminiImages(page, [], 9)).resolves.toEqual(['https://lh3.googleusercontent.com/mid.png']);
     });
 
     it('resolves empty when generation finished without producing an image', async () => {
@@ -209,5 +221,35 @@ describe('gemini image export', () => {
 
         await expect(exportGeminiImages(page, ['blob:https://gemini.google.com/blank'])).resolves.toEqual([]);
         expect(drawImage).not.toHaveBeenCalled();
+    });
+
+    it('exports a hotlink-protected generated image via a new tab when in-page export fails', async () => {
+        const page = createPageMock();
+        mountImage(page.dom, { src: 'https://lh3.googleusercontent.com/gg/ACRwjavi.png', naturalWidth: 0, complete: false });
+        page.dom.window.fetch = () => Promise.reject(new Error('CORS'));
+        // 新 tab 导出路径
+        page.getActivePage = vi.fn().mockReturnValue('tab-orig');
+        page.newTab = vi.fn().mockResolvedValue('tab-new');
+        page.selectTab = vi.fn().mockResolvedValue(undefined);
+        page.closeTab = vi.fn().mockResolvedValue(undefined);
+        page.sleep = vi.fn().mockResolvedValue(undefined);
+        const baseEvaluate = page.evaluate;
+        page.evaluate = vi.fn(async (script) => {
+            // 新 tab 导出脚本（含 document.querySelector('img')）返回可导出的 data URL
+            if (typeof script === 'string' && script.includes("document.querySelector('img')")) {
+                return { dataUrl: PNG_DATA_URL, mimeType: 'image/png' };
+            }
+            return baseEvaluate(script);
+        });
+
+        await expect(exportGeminiImages(page, ['https://lh3.googleusercontent.com/gg/ACRwjavi.png'])).resolves.toEqual([
+            expect.objectContaining({
+                url: 'https://lh3.googleusercontent.com/gg/ACRwjavi.png',
+                dataUrl: PNG_DATA_URL,
+                mimeType: 'image/png',
+            }),
+        ]);
+        expect(page.newTab).toHaveBeenCalledWith('https://lh3.googleusercontent.com/gg/ACRwjavi.png');
+        expect(page.closeTab).toHaveBeenCalledWith('tab-new');
     });
 });

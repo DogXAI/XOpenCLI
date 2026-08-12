@@ -26,7 +26,10 @@ vi.mock('@jackwener/opencli/utils', () => ({
 
 const { imageCommand, resolveOutputDir } = await import('./image.js');
 
-const page = { evaluate: vi.fn().mockResolvedValue('https://gemini.google.com/app/abc123') };
+const page = {
+    evaluate: vi.fn().mockResolvedValue('https://gemini.google.com/app/abc123'),
+    wait: vi.fn().mockResolvedValue(undefined),
+};
 const kwargs = { prompt: 'a red maple leaf', rt: '1:1', st: '', op: '/tmp/gemini-test', sd: false, timeout: 60 };
 
 beforeEach(() => {
